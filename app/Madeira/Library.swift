@@ -265,9 +265,16 @@ struct LibraryEntry: Codable, Identifiable {
     /// sign-in arguments (EpicLibrary.launchArguments) for that launch only.
     var epicAppName: String?
     /// An Epic game with an official way to start without anti-cheat
-    /// (EpicGamesRules.antiCheatOffProgram): nil or true starts that program.
+    /// (epicAntiCheatOffProgram): nil or true starts that program.
     /// The anti-cheat cannot run in Wine on iOS, so on is the default.
     var epicAntiCheatOff: Bool?
+    /// Games with an official way to start without Easy Anti-Cheat (offline modes
+    /// only), as the program to start instead of the one Epic names. Rocket League:
+    /// its Launcher.exe with -noeac ("No Easy Anti Cheat") starts RocketLeague.exe
+    /// with Epic's arguments and nothing else. Madeira starts that program itself,
+    /// which leaves out the launcher's .NET runtime: it crashed in Wine Mono once
+    /// the game had quit, so the session never ended cleanly.
+    static let epicAntiCheatOffProgram: [String: String] = ["Sugar": "RocketLeague.exe"]
     /// Fastsync's per-game switches, used only while Settings › Sync engine is
     /// Fastsync: "Fast synchronization" (nil = on; off gives this game Wine's
     /// standard sync) and "Fast semaphore waits" (nil = off). Optional, so older
@@ -440,7 +447,7 @@ struct LibraryEntry: Codable, Identifiable {
     /// What a launch starts, relative to drive_c: "The game"'s program inside the
     /// install folder, else `relativePath`.
     var launchRelativePath: String {
-        if let app = epicAppName, epicAntiCheatOff != false, let program = EpicGamesRules.antiCheatOffProgram[app] {
+        if let app = epicAppName, epicAntiCheatOff != false, let program = Self.epicAntiCheatOffProgram[app] {
             // The program next to the one Epic names (Rocket League: Launcher.exe -> RocketLeague.exe).
             let folder = relativePath.split(separator: "/").dropLast().joined(separator: "/")
             return folder.isEmpty ? program : folder + "/" + program
