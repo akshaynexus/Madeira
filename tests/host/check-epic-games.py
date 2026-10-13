@@ -22,6 +22,7 @@ the first answer for each chunk, one healthy) and checks:
 * resume: a cancelled install keeps its finished files and fetches less again;
 * update: changed files rewritten, unchanged ones not fetched, removed ones deleted;
 * repair: a damaged file is found by its SHA-1 and fetched again;
+* JSON: an older JSON manifest (1 MiB version 2 chunks) parses and installs;
 * hostile input: '..' paths, a truncated manifest and a wrong key throw.
 """
 from pathlib import Path
@@ -384,6 +385,68 @@ try:
             require(not bad.get('ok') and 'missingKey' in bad.get('error', ''), f'{label}: no key, no manifest')
             wrong = run('parse', manifest=manifest, secrets={list(b.secrets())[0]: (b'\x01' * 32).hex()})
             require(not wrong.get('ok') and 'decrypt' in wrong.get('error', ''), f'{label}: a wrong key throws')
+
+    # A JSON manifest (older builds; ported from willfaust/Madeira#207 by iediot, after
+    # Legendary's json_manifest.py): blobs of three decimal digits per byte, little-endian,
+    # GUID keys as four big-endian words, and 1 MiB chunk windows (the last one padded)
+    # in version 2 chunk files, which do not store their window size.
+    def jblob(data):
+        return ''.join(f'{b:03d}' for b in data)
+
+    def jnum(n, width):
+        return jblob(n.to_bytes(width, 'little'))
+
+    json_files = {
+        'Engine/Binaries/Win64/Old.exe': blob(700_000),
+        'Old/Content/data.pak': blob(900_000),
+        'Old/empty.ini': b'',
+    }
+    jrng = random.Random(13)
+    stream, jwindow = b''.join(json_files.values()), 1 << 20
+    jchunks, jlist = {}, []
+    for cut in range(0, len(stream), jwindow):
+        guid = tuple(jrng.getrandbits(32) for _ in range(4))
+        window = stream[cut:cut + jwindow].ljust(jwindow, b'\0')
+        payload = zlib.compress(window)
+        head = struct.pack('<IIII', 0xB1FE3AA2, 2, 62, len(payload)) + struct.pack('<IIII', *guid)
+        head += struct.pack('<QB', jrng.getrandbits(64), 1) + hashlib.sha1(window).digest() + bytes([1])
+        jchunks[guid] = dict(file=head + payload, window=window, hash=struct.unpack('<Q', head[36:44])[0],
+                             group=zlib.crc32(struct.pack('<IIII', *guid)) % 100)
+        jlist.append((cut, guid))
+    jhex = lambda g: ''.join(f'{w:08X}' for w in g)
+    jfml, pos = [], 0
+    for name, data in json_files.items():
+        parts = []
+        for (cut, guid) in jlist:
+            lo, hi = max(pos, cut), min(pos + len(data), cut + jwindow)
+            if lo < hi:
+                parts.append({'Guid': jhex(guid), 'Offset': jnum(lo - cut, 4), 'Size': jnum(hi - lo, 4)})
+        jfml.append({'Filename': name, 'FileHash': jblob(hashlib.sha1(data).digest()), 'FileChunkParts': parts})
+        pos += len(data)
+    jmanifest = json.dumps({
+        'ManifestFileVersion': jnum(13, 4), 'bIsFileData': False, 'AppID': jnum(0, 4), 'AppNameString': 'OldApp',
+        'BuildVersionString': '1.0-json', 'LaunchExeString': 'Engine\\Binaries\\Win64\\Old.exe', 'LaunchCommand': '-old',
+        'PrereqIds': [], 'PrereqName': '', 'PrereqPath': '', 'PrereqArgs': '', 'FileManifestList': jfml,
+        'ChunkHashList': {jhex(g): jnum(c['hash'], 8) for g, c in jchunks.items()},
+        'ChunkShaList': {jhex(g): hashlib.sha1(c['window']).hexdigest().upper() for g, c in jchunks.items()},
+        'DataGroupList': {jhex(g): jnum(c['group'], 1) for g, c in jchunks.items()},
+        'ChunkFilesizeList': {jhex(g): jnum(len(c['file']), 8) for g, c in jchunks.items()},
+        'CustomFields': {},
+    }, indent=1).encode()
+    jpaths = {g: f'ChunksV3/{c["group"]:02d}/{c["hash"]:016X}_{jhex(g)}.chunk' for g, c in jchunks.items()}
+    parsed = run('parse', manifest=b'\n ' + jmanifest)
+    require(parsed.get('ok') and parsed['level'] == 13 and parsed['files'] == list(json_files) and parsed['build'] == '1.0-json'
+            and parsed['exe'] == 'Engine\\Binaries\\Win64\\Old.exe' and parsed['command'] == '-old'
+            and parsed['sizes'] == [len(v) for v in json_files.values()] and parsed['paths'] == sorted(jpaths.values()),
+            f'JSON manifest parses ({parsed.get("error", "")[:200]})')
+    served.clear(); flaky_seen.clear()
+    for g, c in jchunks.items():
+        served[jpaths[g]] = c['file']
+    folder, journal = work / 'install-json', work / 'jjson/app.journal'
+    res = run('install', '--bases', BASES, '--folder', str(folder), '--journal', str(journal), manifest=jmanifest)
+    require(res.get('ok') and tree(folder) == json_files, f'JSON manifest: install writes every file ({res.get("error", "")[:300]})')
+    bad_json = run('parse', manifest=jmanifest.replace(b'"FileHash": "', b'"FileHash": "9'))
+    require(not bad_json.get('ok'), 'JSON manifest: a malformed blob throws')
 
     # Resume: cancel half-way, then continue.
     big = {f'Content/Paks/p{i}.pak': blob(200_000) for i in range(8)}

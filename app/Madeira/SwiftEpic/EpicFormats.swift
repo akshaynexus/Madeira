@@ -8,8 +8,8 @@ import Foundation
 
 // Epic's content formats (docs/EPIC_GAMES.md, "How it works"): the binary build
 // manifest (header, metadata, chunk list, file list, custom fields and, from
-// feature level 24, an encrypted block with the file names) and the chunk
-// container the CDN serves. Little-endian throughout. Everything here is pure
+// feature level 24, an encrypted block with the file names), the older JSON
+// manifest, and the chunk container the CDN serves. Little-endian throughout. Everything here is pure
 // Foundation, CryptoKit and Compression, so the host test compiles it as is.
 // Hostile input throws; it never traps.
 
@@ -259,7 +259,7 @@ struct EpicManifest: Sendable {
 
     /// Parses a manifest as served (and checked against the API's hash by the caller).
     static func parse(_ data: Data, secrets: [String: String] = [:]) throws -> EpicManifest {
-        if data.first == UInt8(ascii: "{") { throw EpicFormatError.unsupported("JSON manifest") }
+        if data.first(where: { ![9, 10, 13, 32].contains($0) }) == UInt8(ascii: "{") { return try json(data) }
         var header = EpicReader(data)
         guard try header.u32() == magic else { throw EpicFormatError.badMagic("manifest") }
         let headerSize = Int(try header.u32())
@@ -384,6 +384,101 @@ struct EpicManifest: Sendable {
         return EpicManifest(featureLevel: level, appName: appName, buildVersion: buildVersion, launchExe: launchExe,
                             launchCommand: launchCommand, prerequisiteName: prereqName, prerequisitePath: prereqPath,
                             prerequisiteArgs: prereqArgs, chunks: byGUID, files: files)
+    }
+
+    // MARK: JSON manifests
+
+    // Older builds have a JSON manifest: the same lists, keyed by chunk GUID, with
+    // numbers and hashes as "blobs" (three decimal digits per byte, little-endian).
+    // Ported from willfaust/Madeira#207 (iediot), after Legendary's json_manifest.py.
+
+    /// A blob's bytes: "012255" is [12, 255].
+    static func blob(_ value: Any?) throws -> Data {
+        guard let text = value as? String else { throw EpicFormatError.badMagic("manifest") }
+        let digits = Array(text.utf8)
+        guard digits.count % 3 == 0, digits.allSatisfy({ $0 >= 48 && $0 <= 57 }) else { throw EpicFormatError.badMagic("manifest") }
+        var out = Data(capacity: digits.count / 3)
+        for i in stride(from: 0, to: digits.count, by: 3) {
+            let byte = Int(digits[i] - 48) * 100 + Int(digits[i + 1] - 48) * 10 + Int(digits[i + 2] - 48)
+            guard byte <= 255 else { throw EpicFormatError.badMagic("manifest") }
+            out.append(UInt8(byte))
+        }
+        return out
+    }
+
+    /// A blob read as a little-endian number of up to eight bytes.
+    static func number(_ value: Any?) throws -> UInt64 {
+        let bytes = try blob(value)
+        guard bytes.count <= 8 else { throw EpicFormatError.badMagic("manifest") }
+        return bytes.reversed().reduce(0) { $0 << 8 | UInt64($1) }
+    }
+
+    /// A GUID as the JSON keys write it: 32 hex digits, four big-endian words.
+    static func guid(json text: String) throws -> EpicGUID {
+        let chars = Array(text.utf8)
+        guard chars.count == 32 else { throw EpicFormatError.badMagic("manifest") }
+        var words = [UInt32]()
+        for i in stride(from: 0, to: 32, by: 8) {
+            guard let word = UInt32(String(decoding: chars[i..<i + 8], as: UTF8.self), radix: 16) else { throw EpicFormatError.badMagic("manifest") }
+            words.append(word)
+        }
+        return EpicGUID(a: words[0], b: words[1], c: words[2], d: words[3])
+    }
+
+    static func json(_ data: Data) throws -> EpicManifest {
+        guard let j = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let sizes = j["ChunkFilesizeList"] as? [String: Any], let hashes = j["ChunkHashList"] as? [String: Any],
+              let groups = j["DataGroupList"] as? [String: Any], let fileList = j["FileManifestList"] as? [[String: Any]] else {
+            throw EpicFormatError.badMagic("manifest")
+        }
+        if j["bIsFileData"] as? Bool == true { throw EpicFormatError.unsupported("file-data manifest") }
+        let shas = j["ChunkShaList"] as? [String: Any] ?? [:]
+        func size(_ value: Any?) throws -> UInt64 {
+            let n = try number(value)
+            guard n <= UInt64(Int32.max) else { throw EpicFormatError.badMagic("manifest") }
+            return n
+        }
+        let level = UInt32(truncatingIfNeeded: try number(j["ManifestFileVersion"] ?? "013000000000"))
+
+        var byGUID = [EpicGUID: EpicChunkInfo](minimumCapacity: sizes.count)
+        for (key, fileSize) in sizes {
+            let id = try guid(json: key)
+            var sha = Data()
+            if let hex = shas[key] as? String {
+                guard let bytes = Data(hex: hex), bytes.count == 20 else { throw EpicFormatError.badMagic("manifest") }
+                sha = bytes
+            }
+            // JSON manifests do not store a window size: chunks of this era are always 1 MiB.
+            var chunk = EpicChunkInfo(guid: id, hash: try number(hashes[key]), sha1: sha,
+                                      group: UInt8(truncatingIfNeeded: try number(groups[key])), windowSize: 1 << 20,
+                                      fileSize: Int64(try size(fileSize)))
+            chunk.path = path(of: chunk, level: level)
+            byGUID[id] = chunk
+        }
+
+        var files = [EpicFileEntry]()
+        files.reserveCapacity(fileList.count)
+        for item in fileList {
+            guard let name = item["Filename"] as? String, let parts = item["FileChunkParts"] as? [[String: Any]] else {
+                throw EpicFormatError.badMagic("manifest")
+            }
+            let sha = try blob(item["FileHash"])
+            guard sha.count == 20 else { throw EpicFormatError.badMagic("manifest") }
+            let flags = (item["bIsReadOnly"] as? Bool == true ? 1 : 0) | (item["bIsCompressed"] as? Bool == true ? 2 : 0)
+                | (item["bIsUnixExecutable"] as? Bool == true ? 4 : 0)
+            var file = EpicFileEntry(name: name, symlinkTarget: "", sha1: sha, flags: UInt8(flags), parts: [])
+            for part in parts {
+                guard let key = part["Guid"] as? String else { throw EpicFormatError.badMagic("manifest") }
+                file.parts.append(EpicChunkPart(guid: try guid(json: key), offset: UInt32(try size(part["Offset"])),
+                                                size: UInt32(try size(part["Size"]))))
+            }
+            files.append(file)
+        }
+        func text(_ key: String) -> String { j[key] as? String ?? "" }
+        return EpicManifest(featureLevel: level, appName: text("AppNameString"), buildVersion: text("BuildVersionString"),
+                            launchExe: text("LaunchExeString"), launchCommand: text("LaunchCommand"),
+                            prerequisiteName: text("PrereqName"), prerequisitePath: text("PrereqPath"),
+                            prerequisiteArgs: text("PrereqArgs"), chunks: byGUID, files: files)
     }
 
     /// A path from the file list as folder components, or nil when it would leave the

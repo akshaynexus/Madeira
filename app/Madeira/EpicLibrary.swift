@@ -31,6 +31,9 @@ struct EpicOwnedGame: Codable, Identifiable, Hashable, Sendable {
     var canRunOffline: Bool
     var requiresOwnershipToken: Bool
     var additionalCommandLine: String?
+    /// The catalog's category paths ("games", "engines", ...); nil in a list cached
+    /// before they were kept, which looks the game up again.
+    var categories: [String]? = nil
     var id: String { appName }
 }
 
@@ -84,7 +87,10 @@ struct EpicInstalledGame: Codable, Sendable {
     private var resumeAfterBackground = Set<String>()
     private var started = false
     private var timer: Timer?
-    private var graceTask: UIBackgroundTaskIdentifier = .invalid
+    /// iOS 26 and later: a continued-processing task keeps the queue running in the
+    /// background ("<bundle id>.download.epic"); earlier iOS: the short grace period,
+    /// then a clean pause. Ported from willfaust/Madeira#207 (iediot).
+    private lazy var background = SteamDownloadBackground(source: "Epic Games", suffix: "epic")
     private let api = EpicAPI.shared
     private let downloader = EpicDownloader()
 
@@ -127,12 +133,9 @@ struct EpicInstalledGame: Codable, Sendable {
     func start() {
         guard Self.enabled, !started else { return }
         started = true
-        NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.beginGrace() }
-        }
-        NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.endGrace(); self?.resumeFromBackground(); self?.reconcileSession() }
-        }
+        background.attach(active: { [weak self] in self?.hasActiveDownload == true },
+                          pause: { [weak self] in self?.pauseForBackground() },
+                          resume: { [weak self] in self?.resumeFromBackground(); self?.reconcileSession() })
         Task {
             let account = await api.account()
             signedIn = account != nil
@@ -210,8 +213,11 @@ struct EpicInstalledGame: Codable, Sendable {
         do {
             let assets = try await api.assets().filter { $0.namespace != "ue" }
             var known = Dictionary(owned.map { ($0.appName, $0) }, uniquingKeysWith: { a, _ in a })
-            // Catalog details for new games, or games whose build changed; at most eight at once.
-            let wanted = assets.filter { known[$0.appName] == nil || known[$0.appName]?.buildVersion != $0.buildVersion }
+            // Catalog details for new games, games whose build changed and games cached without
+            // their categories; at most eight at once.
+            let wanted = assets.filter {
+                known[$0.appName] == nil || known[$0.appName]?.buildVersion != $0.buildVersion || known[$0.appName]?.categories == nil
+            }
             var details: [String: EpicCatalogItem] = [:]
             try await withThrowingTaskGroup(of: (String, EpicCatalogItem?).self) { group in
                 var next = 0
@@ -229,8 +235,9 @@ struct EpicInstalledGame: Codable, Sendable {
             var games: [EpicOwnedGame] = []
             for asset in assets {
                 if let item = details[asset.appName] {
-                    // Not games: DLC (installed with its game), mods, and games another store manages.
-                    if item.isDLC || item.categories.contains("mods") || item.attributes["ThirdPartyManagedApp"] != nil { known[asset.appName] = nil; continue }
+                    if item.isDLC || item.attributes["ThirdPartyManagedApp"] != nil || !Self.isGame(categories: item.categories) {
+                        known[asset.appName] = nil; continue
+                    }
                     let images = item.images
                     games.append(EpicOwnedGame(
                         appName: asset.appName, title: item.title.isEmpty ? asset.appName : item.title, namespace: asset.namespace,
@@ -240,8 +247,8 @@ struct EpicInstalledGame: Codable, Sendable {
                         folderName: Self.safeName(item.attributes["FolderName"] ?? asset.appName),
                         canRunOffline: (item.attributes["CanRunOffline"] ?? "true").lowercased() == "true",
                         requiresOwnershipToken: (item.attributes["OwnershipToken"] ?? "false").lowercased() == "true",
-                        additionalCommandLine: item.attributes["AdditionalCommandLine"]))
-                } else if var game = known[asset.appName] {
+                        additionalCommandLine: item.attributes["AdditionalCommandLine"], categories: item.categories))
+                } else if var game = known[asset.appName], Self.isGame(categories: game.categories ?? []) {
                     game.buildVersion = asset.buildVersion
                     games.append(game)
                 }
@@ -253,6 +260,19 @@ struct EpicInstalledGame: Codable, Sendable {
         } catch {
             handle(error, context: "library", report: interactive)
         }
+    }
+
+    /// Whether a catalog item with these categories belongs in the games list. Not games:
+    /// mods (as Legendary) and add-ons ("addons/durable", "addons/consumable": ported from
+    /// willfaust/Madeira#207, iediot), and Unreal Engine content outside the "ue"
+    /// namespace: marketplace assets, plugins and sample projects ("Animation Starter
+    /// Pack"), and engines and editors ("ARK ModKit (UE4)" is filed under "engines" and
+    /// "applications"). An item filed under "games" always stays.
+    static func isGame(categories: [String]) -> Bool {
+        let roots = Set(categories.map { $0.split(separator: "/").first.map(String.init) ?? $0 })
+        if roots.contains("mods") || roots.contains("addons") { return false }
+        if roots.contains("games") { return true }
+        return roots.isDisjoint(with: ["assets", "plugins", "projects", "engines"])
     }
 
     func updateAvailable(_ app: String) -> Bool {
@@ -335,11 +355,12 @@ struct EpicInstalledGame: Codable, Sendable {
             await self.run(app)
         }
         active = (app, task)
-        if UIApplication.shared.applicationState != .active { beginGrace() }
+        background.downloadStarted(appID: 0, name: game(app)?.title ?? installed[app]?.title ?? "Epic game")
     }
 
     private func run(_ app: String) async {
         let kind = downloads[app]?.kind ?? .install
+        var outcome = SteamDownloadBackground.Outcome.paused
         do {
             guard let game = game(app) ?? installed[app].map({ record in
                 EpicOwnedGame(appName: record.appName, title: record.title, namespace: record.namespace, catalogItemID: record.catalogItemID,
@@ -367,7 +388,10 @@ struct EpicInstalledGame: Codable, Sendable {
                 manifest: manifest, baseURLs: location.baseURLs, secrets: location.secrets,
                 folder: Self.drive.appendingPathComponent(folder, isDirectory: true),
                 previous: kind == .repair ? nil : previous, verifyAll: kind == .repair, journal: Self.journalURL(app)) { progress in
-                    Task { @MainActor in EpicLibrary.shared.downloads[app]?.progress = progress }
+                    Task { @MainActor in
+                        EpicLibrary.shared.downloads[app]?.progress = progress
+                        EpicLibrary.shared.background.progress(doneBytes: progress.doneBytes, totalBytes: progress.totalBytes)
+                    }
                 }
             try? FileManager.default.createDirectory(at: Self.manifestURL(app).deletingLastPathComponent(), withIntermediateDirectories: true)
             try? data.write(to: Self.manifestURL(app), options: .atomic)
@@ -380,6 +404,7 @@ struct EpicInstalledGame: Codable, Sendable {
             installed[app] = finished
             writeInstalled()
             downloads[app] = nil
+            outcome = .completed
             await LibraryModel.shared.upsertEpic(finished, cover: game.cover)
             EpicLog.event("[epic-download] done app=\(app) written=\(result.filesWritten) kept=\(result.filesKept) fetched=\(result.bytesFetched)")
         } catch {
@@ -388,11 +413,13 @@ struct EpicInstalledGame: Codable, Sendable {
                 EpicLog.event("[epic-download] paused app=\(app)")
             } else {
                 downloads[app]?.state = .failed(error.localizedDescription)
+                outcome = .failed(error.localizedDescription)
                 handle(error, context: "download app=\(app)", report: false)
             }
         }
         active = nil
-        if queue.isEmpty { endGrace() }
+        background.downloadEnded(appID: 0, name: game(app)?.title ?? installed[app]?.title ?? "Epic game",
+                                 outcome: outcome, queueEmpty: queue.isEmpty)
         pump()
     }
 
@@ -432,26 +459,14 @@ struct EpicInstalledGame: Codable, Sendable {
         }
     }
 
-    /// iOS gives a short grace period in the background; when it ends, downloads
-    /// pause cleanly (finished files are journaled) and continue when Madeira is active.
-    private func beginGrace() {
-        guard graceTask == .invalid, hasActiveDownload else { return }
-        graceTask = UIApplication.shared.beginBackgroundTask(withName: "Madeira Epic download") { [weak self] in
-            MainActor.assumeIsolated {
-                guard let self else { return }
-                if let current = self.active { self.resumeAfterBackground.insert(current.app); current.task.cancel() }
-                for app in self.queue { self.resumeAfterBackground.insert(app); self.downloads[app]?.state = .paused }
-                self.queue.removeAll()
-                EpicLog.event("[epic-download] paused for the background count=\(self.resumeAfterBackground.count)")
-                self.endGrace()
-            }
-        }
-    }
-
-    private func endGrace() {
-        guard graceTask != .invalid else { return }
-        UIApplication.shared.endBackgroundTask(graceTask)
-        graceTask = .invalid
+    /// iOS ended Madeira's background time (the grace period before iOS 26, or the
+    /// continued-processing task): downloads pause cleanly (finished files are
+    /// journaled) and continue when Madeira is active.
+    private func pauseForBackground() {
+        if let current = active { resumeAfterBackground.insert(current.app); current.task.cancel() }
+        for app in queue { resumeAfterBackground.insert(app); downloads[app]?.state = .paused }
+        queue.removeAll()
+        EpicLog.event("[epic-download] paused for the background count=\(resumeAfterBackground.count)")
     }
 
     private func resumeFromBackground() {

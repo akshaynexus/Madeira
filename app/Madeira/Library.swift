@@ -264,8 +264,8 @@ struct LibraryEntry: Codable, Identifiable {
     /// its program inside C:\Program Files\Epic Games, and each start adds Epic's
     /// sign-in arguments (EpicLibrary.launchArguments) for that launch only.
     var epicAppName: String?
-    /// An Epic game with an official "start without anti-cheat" switch
-    /// (EpicGamesRules.antiCheatOffArgument): nil or true adds it at each start.
+    /// An Epic game with an official way to start without anti-cheat
+    /// (EpicGamesRules.antiCheatOffProgram): nil or true starts that program.
     /// The anti-cheat cannot run in Wine on iOS, so on is the default.
     var epicAntiCheatOff: Bool?
     /// Fastsync's per-game switches, used only while Settings › Sync engine is
@@ -322,14 +322,8 @@ struct LibraryEntry: Codable, Identifiable {
     /// while its launch is being prepared.
     var programArguments: String {
         let own = startsSteamGameDirectly ? (steamProgramArguments ?? "") : arguments
-        guard let app = epicAppName else { return own }
-        var parts = [own]
-        if epicAntiCheatOff != false, let flag = EpicGamesRules.antiCheatOffArgument[app],
-           !own.split(separator: " ").contains(Substring(flag)) {
-            parts.append(flag)
-        }
-        if let transient = Self.transientArguments(for: id), !transient.isEmpty { parts.insert(transient, at: 0) }
-        return parts.filter { !$0.isEmpty }.joined(separator: " ")
+        guard epicAppName != nil, let transient = Self.transientArguments(for: id), !transient.isEmpty else { return own }
+        return own.isEmpty ? transient : transient + " " + own
     }
     /// Arguments for the launch being prepared only (an Epic game's one-use sign-in
     /// code): never part of the saved entry. ContentView sets them before the launch;
@@ -446,6 +440,11 @@ struct LibraryEntry: Codable, Identifiable {
     /// What a launch starts, relative to drive_c: "The game"'s program inside the
     /// install folder, else `relativePath`.
     var launchRelativePath: String {
+        if let app = epicAppName, epicAntiCheatOff != false, let program = EpicGamesRules.antiCheatOffProgram[app] {
+            // The program next to the one Epic names (Rocket League: Launcher.exe -> RocketLeague.exe).
+            let folder = relativePath.split(separator: "/").dropLast().joined(separator: "/")
+            return folder.isEmpty ? program : folder + "/" + program
+        }
         guard startsSteamGameDirectly, let program = steamProgram, !program.isEmpty else { return relativePath }
         return relativePath + "/" + program
     }

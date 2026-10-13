@@ -25,7 +25,7 @@ enum EpicDownloadError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .diskSpace(let needed):
-            return "Not enough free space: this download needs about \(ByteCountFormatter.string(fromByteCount: needed, countStyle: .file)) more."
+            return "Not enough free space on this device: this download needs about \(ByteCountFormatter.string(fromByteCount: needed, countStyle: .file)) more. Free some space, then try again."
         case .chunk(let reason): return "A game file could not be downloaded from Epic (\(reason)). Try again to continue."
         case .noServers: return "Epic did not name a download server for this game."
         }
@@ -146,8 +146,11 @@ final class EpicDownloader: @unchecked Sendable {
             growth += max(0, item.file.size - old)
             largest = max(largest, item.file.size)
         }
-        if let free = (try? folder.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?.volumeAvailableCapacityForImportantUsage,
-           free < growth + largest + (64 << 20) {
+        // Checked before any chunk is fetched, on a resume too (only what is still needed
+        // counts). Some volumes report zero for the important-usage estimate although they
+        // have free blocks, so the plain capacity is the fallback (ported from
+        // willfaust/Madeira#207, iediot).
+        if let free = Self.freeSpace(at: folder), free < growth + largest + (64 << 20) {
             throw EpicDownloadError.diskSpace(needed: growth + largest + (64 << 20) - free)
         }
 
@@ -274,6 +277,15 @@ final class EpicDownloader: @unchecked Sendable {
             }
         }
         throw EpicDownloadError.chunk(lastReason)
+    }
+
+    /// Free bytes on the volume of `url`, or nil when the volume does not say.
+    static func freeSpace(at url: URL) -> Int64? {
+        guard let values = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey, .volumeAvailableCapacityKey])
+        else { return nil }
+        let important = values.volumeAvailableCapacityForImportantUsage, plain = values.volumeAvailableCapacity.map(Int64.init)
+        if important == nil && plain == nil { return nil }
+        return max(important ?? 0, plain ?? 0)
     }
 
     static func sha1(of url: URL, progress: (Int) -> Void = { _ in }) throws -> Data {

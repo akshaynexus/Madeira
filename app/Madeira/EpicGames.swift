@@ -18,10 +18,13 @@ struct EpicItem: Identifiable {
 }
 
 enum EpicGamesRules {
-    /// Games whose own launcher has an official switch that starts them without
-    /// Easy Anti-Cheat (offline modes only). Rocket League: "No Easy Anti Cheat",
-    /// Launcher.exe -noeac.
-    static let antiCheatOffArgument: [String: String] = ["Sugar": "-noeac"]
+    /// Games with an official way to start without Easy Anti-Cheat (offline modes
+    /// only), as the program to start instead of the one Epic names. Rocket League:
+    /// its Launcher.exe with -noeac ("No Easy Anti Cheat") starts RocketLeague.exe
+    /// with Epic's arguments and nothing else. Madeira starts that program itself,
+    /// which leaves out the launcher's .NET runtime: it crashed in Wine Mono once
+    /// the game had quit, so the session never ended cleanly.
+    static let antiCheatOffProgram: [String: String] = ["Sugar": "RocketLeague.exe"]
 
     /// Installed games and the account's other games, by title, filtered by the search.
     @MainActor static func items(_ epic: EpicLibrary, search: String) -> [EpicItem] {
@@ -347,7 +350,7 @@ struct EpicGameSheet: View {
                     }
                     Section {
                         if let freeSpace { LabeledContent("Free space on this device", value: ByteCountFormatter.string(fromByteCount: freeSpace, countStyle: .file)) }
-                        Text("Games download directly from Epic with your account into C:\\Program Files\\Epic Games. Keep Madeira open while it downloads: in the background iOS allows only a short time, then the download pauses and continues when you return. A download also pauses while a game is running.")
+                        Text("Games download directly from Epic with your account into C:\\Program Files\\Epic Games. On iOS 26 and later the download continues in the background, with its progress shown by iOS. On earlier iOS, keep Madeira open while it downloads: in the background iOS allows only a short time, then the download pauses and continues when you return. A download also pauses while a game is running.")
                             .font(.footnote).foregroundStyle(.secondary)
                     }
                 } else {
@@ -358,8 +361,7 @@ struct EpicGameSheet: View {
             .navigationTitle("Epic Games").navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
             .task(id: epic.downloads[appName]?.state) {
-                let values = try? URL.documentsDirectory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-                freeSpace = values?.volumeAvailableCapacityForImportantUsage
+                freeSpace = EpicDownloader.freeSpace(at: URL.documentsDirectory)
             }
             .confirmationDialog(epic.installed[appName] == nil ? "Cancel this download? Downloaded files are deleted." : "Stop this download?",
                                 isPresented: $confirmCancel, titleVisibility: .visible) {
@@ -436,7 +438,7 @@ struct EpicEntrySection: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
-            if EpicGamesRules.antiCheatOffArgument[app] != nil {
+            if EpicGamesRules.antiCheatOffProgram[app] != nil {
                 Toggle("Start without Easy Anti-Cheat", isOn: Binding(get: { entry.epicAntiCheatOff != false },
                                                                        set: { entry.epicAntiCheatOff = $0 ? nil : false }))
                 Text("Easy Anti-Cheat cannot run in Wine on iOS. With this on, the game starts in its own offline mode without it: offline matches, training, LAN and replays work, online matches do not.")
