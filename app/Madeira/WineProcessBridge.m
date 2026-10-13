@@ -23,6 +23,7 @@
 #include <sys/stat.h>
 #include <limits.h>
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <sys/sysctl.h>
@@ -1557,6 +1558,11 @@ static void *wine_process_thread(void *arg) {
         argv[argc] = NULL;
         dprintf(STDERR_FILENO, "[WineProc] argv[1] = %s\n", exe_path);
         for (int i = 0; i < extra_argc; i++) {
+            /* An Epic game's one-use sign-in code (EpicLibrary.launchArguments) stays out of the log. */
+            if (strncasecmp(extra_argv[i], "-AUTH_PASSWORD=", 15) == 0) {
+                dprintf(STDERR_FILENO, "[WineProc] argv[%d] = -AUTH_PASSWORD=<redacted>\n", 2 + i);
+                continue;
+            }
             dprintf(STDERR_FILENO, "[WineProc] argv[%d] = %s\n", 2 + i, extra_argv[i]);
         }
 
